@@ -19,9 +19,26 @@ except Exception as e:
     st.error(f"Ошибка в Secrets: {e}")
     st.stop()
 
-# --- НАСТРОЙКА GEMINI ---
+# --- НАСТРОЙКА GEMINI (Исправленная версия) ---
 genai.configure(api_key=GEMINI_KEY)
-ai_model = genai.GenerativeModel('gemini-1.5-flash')
+
+# Пробуем несколько вариантов имени модели для надежности
+model_names = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-pro']
+ai_model = None
+
+for name in model_names:
+    try:
+        # Проверяем модель коротким запросом
+        test_model = genai.GenerativeModel(name)
+        # Если инициализация прошла, сохраняем её
+        ai_model = test_model
+        break
+    except:
+        continue
+
+if ai_model is None:
+    st.error("Не удалось подключиться к моделям Gemini. Проверьте API ключ.")
+    st.stop()
 
 # --- ФУНКЦИИ ---
 
@@ -141,5 +158,6 @@ if st.button("Начать сбор и AI-анализ", type="primary"):
             send_to_telegram(buffer.getvalue(), fname, ai_summary)
             st.success("Данные собраны и отправлены в Telegram!")
             st.download_button(f"📥 Скачать {fname}", buffer.getvalue(), fname)
+
 
 

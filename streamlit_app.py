@@ -18,9 +18,23 @@ except Exception as e:
     st.error(f"Ошибка Secrets: {e}")
     st.stop()
 
+# --- ИНИЦИАЛИЗАЦИЯ ПАМЯТИ (SESSION STATE) ---
+# Это "жесткий диск" вашего приложения. Данные здесь не исчезают при обновлении.
+if 'data_processed' not in st.session_state:
+    st.session_state['data_processed'] = False
+if 'excel_buffer' not in st.session_state:
+    st.session_state['excel_buffer'] = None
+if 'file_name' not in st.session_state:
+    st.session_state['file_name'] = ""
+if 'ai_summary' not in st.session_state:
+    st.session_state['ai_summary'] = None
+if 'model_name' not in st.session_state:
+    st.session_state['model_name'] = None
+
 # --- ТЕЛЕГРАМ ---
 def send_results_to_telegram(file_data, file_name, ai_text=None):
     try:
+        # 1. Документ
         caption = f"📂 {file_name}"
         if ai_text: caption += "\n\n(Отчет AI ниже)"
         requests.post(
@@ -28,6 +42,7 @@ def send_results_to_telegram(file_data, file_name, ai_text=None):
             data={'chat_id': TG_CHAT_ID, 'caption': caption}, 
             files={'document': (file_name, file_data)}
         )
+        # 2. Текст (если есть)
         if ai_text:
             url_msg = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
             if len(ai_text) > 4000:
@@ -45,17 +60,18 @@ def get_ai_summary(comments_list):
     
     prompt = f"""
     Проанализируй комментарии YouTube.
-    Напиши отчет на русском:
-    1. 🎭 Настроение.
-    2. 🔥 Темы споров.
-    3. 👍 Позитив.
-    4. 👎 Негатив.
-    5. 🧠 Вывод.
+    Напиши отчет на русском языке. Используй форматирование Markdown.
+    Структура:
+    1. 🎭 Настроение
+    2. 🔥 Темы споров
+    3. 👍 Позитив
+    4. 👎 Негатив
+    5. 🧠 Вывод
     
     Текст: {text_corpus}
     """
     
-    # Приоритет на 2.5-flash, так как она сработала
+    # Приоритет на 2.5, так как она проверена
     models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash']
     
     last_error = ""
@@ -107,69 +123,78 @@ def process_videos(api_key, urls):
 
 # --- ИНТЕРФЕЙС ---
 
-# 1. ЗАГОЛОВОК (HTML для центрирования и уменьшения размера)
-st.markdown("<h3 style='text-align: center;'>YouTubeComm</h3>", unsafe_allow_html=True)
+# 1. Стиль заголовка (по центру, уменьшенный)
+st.markdown("<h3 style='text-align: center; margin-bottom: 20px;'>YouTubeComm</h3>", unsafe_allow_html=True)
 
-# Инициализация хранилища (чтобы файл не пропадал на телефоне)
-if 'excel_data' not in st.session_state:
-    st.session_state['excel_data'] = None
-if 'file_name' not in st.session_state:
-    st.session_state['file_name'] = None
-
-raw_urls = st.text_area("Ссылка на видео:", height=100)
+# 2. Ввод данных
+raw_urls = st.text_area("Ссылка на видео:", height=100, placeholder="Вставьте ссылку сюда...")
 use_ai = st.toggle("Подключить AI-анализ", value=False)
 
-# 2. КНОПКИ В ОДИН РЯД (Колонки)
-col1, col2 = st.columns([1, 1])
-
-with col1:
-    # Кнопка НАЧАТЬ
-    if st.button("Начать работу", type="primary", use_container_width=True):
-        if not raw_urls:
-            st.warning("Вставьте ссылку")
-        else:
-            with st.spinner('Парсинг...'):
-                data, fname = process_videos(API_KEY, raw_urls.split('\n'))
+# 3. КНОПКА ЗАПУСКА
+# Мы используем callback или просто проверку нажатия.
+if st.button("Начать работу", type="primary", use_container_width=True):
+    if not raw_urls:
+        st.warning("Вставьте ссылку")
+    else:
+        # СБРАСЫВАЕМ СТАРЫЕ ДАННЫЕ
+        st.session_state['data_processed'] = False
+        st.session_state['ai_summary'] = None
+        
+        with st.spinner('Обработка...'):
+            # А. Скачиваем данные
+            data, fname = process_videos(API_KEY, raw_urls.split('\n'))
             
             if data:
-                # Сохраняем в память сессии
+                # Б. Готовим Excel
                 df = pd.DataFrame(data)
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     df.to_excel(writer, index=False)
                 
-                st.session_state['excel_data'] = buffer.getvalue()
-                st.session_state['file_name'] = fname
+                # В. Анализ AI
+                summary_text = None
+                mod_name = None
                 
-                # AI Анализ
-                summary = None
                 if use_ai:
-                    with st.spinner('Анализ...'):
-                        summary, model_used = get_ai_summary(data)
-                    if model_used:
-                        st.success(f"Готово! ({model_used})")
-                        st.markdown(summary)
-                    else:
-                        st.error(summary)
-                else:
-                    st.info("Готово (без AI).")
+                    summary_text, mod_name = get_ai_summary(data)
+                
+                # Г. СОХРАНЯЕМ ВСЕ В ПАМЯТЬ (ВАЖНО!)
+                st.session_state['excel_buffer'] = buffer.getvalue()
+                st.session_state['file_name'] = fname
+                st.session_state['ai_summary'] = summary_text
+                st.session_state['model_name'] = mod_name
+                st.session_state['data_processed'] = True # Флаг успеха
+                
+                # Д. Отправляем в телеграм (один раз)
+                send_results_to_telegram(buffer.getvalue(), fname, summary_text)
+                
+            else:
+                st.error("Не удалось собрать комментарии (проверьте ссылку или доступ).")
 
-                # Отправка в ТГ
-                send_results_to_telegram(st.session_state['excel_data'], fname, summary)
-                # Перезагружаем страницу, чтобы кнопка скачивания обновилась
-                st.rerun()
+# --- БЛОК РЕЗУЛЬТАТОВ (ОТОБРАЖАЕТСЯ ВСЕГДА, ЕСЛИ ЕСТЬ ДАННЫЕ) ---
+# Этот блок находится ВНЕ кнопки. Он не исчезнет при обновлении.
 
-with col2:
-    # Кнопка СКАЧАТЬ (Появляется только если файл есть в памяти)
-    if st.session_state['excel_data']:
-        st.download_button(
-            label="Скачать таблицу",
-            data=st.session_state['excel_data'],
-            file_name=st.session_state['file_name'],
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="secondary",
-            use_container_width=True
-        )
+if st.session_state['data_processed']:
+    st.divider() # Разделительная линия
+    
+    # 1. Показываем результат AI
+    if st.session_state['ai_summary']:
+        if st.session_state['model_name']:
+            st.success(f"Анализ готов ({st.session_state['model_name']})")
+            st.markdown(st.session_state['ai_summary'])
+        else:
+            st.error(st.session_state['ai_summary'])
+    elif use_ai:
+        pass # Если AI был включен, но результат пустой (ошибка выше)
     else:
-        # Пустая кнопка для симметрии (неактивная)
-        st.button("Скачать таблицу", disabled=True, use_container_width=True)
+        st.info("Таблица готова (без AI).")
+
+    # 2. Кнопка скачивания (ТЕПЕРЬ ОНА СТАБИЛЬНАЯ)
+    st.download_button(
+        label=f"📥 Скачать {st.session_state['file_name']}",
+        data=st.session_state['excel_buffer'],
+        file_name=st.session_state['file_name'],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="secondary",
+        use_container_width=True
+    )

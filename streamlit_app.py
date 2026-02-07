@@ -5,9 +5,10 @@ from youtube_transcript_api import YouTubeTranscriptApi
 import io
 import re
 import requests
+import time
 
 # --- НАСТРОЙКИ ---
-st.set_page_config(page_title="YouTube Truth Detector", page_icon="⚖️", layout="centered")
+st.set_page_config(page_title="YouTubeComm", page_icon="📡", layout="centered")
 
 # --- СЕКРЕТЫ ---
 try:
@@ -20,21 +21,22 @@ except Exception as e:
     st.stop()
 
 # --- СЕССИЯ ---
-if 'status' not in st.session_state: st.session_state['status'] = ""
+if 'processed' not in st.session_state: st.session_state['processed'] = False
 if 'ai_verdict' not in st.session_state: st.session_state['ai_verdict'] = None
+if 'quota_used' not in st.session_state: st.session_state['quota_used'] = 0
 
 # --- ТЕЛЕГРАМ ---
-def send_to_telegram(file_data, file_name, ai_text=None):
+def send_to_telegram(file_data, file_name, ai_text=None, quota_info=""):
     try:
-        # Файл
-        caption = f"📂 {file_name}"
-        if ai_text: caption += "\n\n(⬇️ ВЕРДИКТ НИЖЕ)"
+        # 1. Файл
+        caption = f"📂 {file_name}\nℹ️ {quota_info}"
+        if ai_text: caption += "\n\n(⬇️ Анализ ниже)"
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument", 
             data={'chat_id': TG_CHAT_ID, 'caption': caption}, 
             files={'document': (file_name, file_data)}
         )
-        # Текст (Разбиваем, если длинный)
+        # 2. Текст
         if ai_text:
             url_msg = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
             if len(ai_text) > 3000:
@@ -46,51 +48,45 @@ def send_to_telegram(file_data, file_name, ai_text=None):
         return True
     except: return False
 
-# --- ФУНКЦИЯ: ЧИТАЕМ СУБТИТРЫ (ТРАНСКРИПЦИЯ) ---
+# --- ТРАНСКРИПЦИЯ ---
 def get_video_transcript(video_id):
     try:
-        # Пытаемся получить русские или английские субтитры
         transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'en'])
-        
-        # Собираем текст в одну строку
-        full_text = " ".join([t['text'] for t in transcript_list])
-        return full_text
-    except:
-        return None # Если субтитров нет или они отключены
+        return " ".join([t['text'] for t in transcript_list])
+    except: return None
 
-# --- AI СУДЬЯ (ТЕПЕРЬ СРАВНИВАЕТ СЛОВА АВТОРА И НАРОДА) ---
-def get_ai_verdict(title, transcript, comments_list):
+# --- AI АНАЛИЗАТОР (Сравнение видео и комментов) ---
+def get_ai_verdict(title, transcript, comments_list, is_deep_scan):
     if not comments_list: return "Нет комментариев."
     
-    # Подготовка данных
-    # Обрезаем транскрипцию, если она слишком огромная (до 15 000 символов), чтобы влезло в контекст
-    transcript_text = transcript[:15000] if transcript else "Субтитры недоступны (анализируем только заголовок)."
+    # Если Deep Scan включен, даем AI больше данных (300 комментов вместо 100)
+    limit = 300 if is_deep_scan else 100
+    transcript_limit = 20000 if is_deep_scan else 10000
     
-    # Берем топ-100 комментариев
-    audience_voice = "\n".join([f"- {str(c['Текст'])[:200]}" for c in comments_list[:100]])
+    # Формируем текст видео
+    transcript_text = transcript[:transcript_limit] if transcript else "Субтитры недоступны."
+    
+    # Формируем мнение народа
+    audience_voice = "\n".join([f"- {str(c['Текст'])[:300]}" for c in comments_list[:limit]])
     
     prompt = f"""
-    Ты — безжалостный детектор лжи и кликбейта. Твоя цель — понять, стоит ли тратить время на это видео.
+    Роль: Ты критический аналитик YouTube. 
+    Задача: Сравни содержание видео (слова автора) с реакцией зрителей.
     
-    1. ВОТ ЧТО ГОВОРИТ АВТОР ВИДЕО (ТРАНСКРИПЦИЯ):
-    Заголовок: {title}
-    Слова из видео: {transcript_text}...
+    1. ИНФОРМАЦИЯ О ВИДЕО:
+    Название: {title}
+    Слова автора (транскрипция): {transcript_text}...
     
-    2. ВОТ ЧТО ГОВОРЯТ ЗРИТЕЛИ (КОММЕНТАРИИ):
+    2. КОММЕНТАРИИ ЗРИТЕЛЕЙ (Анализируем топ-{limit}):
     {audience_voice}
     
-    ЗАДАЧА:
-    Сравни слова автора и реакцию людей. Найди несостыковки.
-    
-    Напиши отчет (Markdown):
-    1. 🎯 **ВЕРДИКТ:** (Смотреть / Не смотреть / Кликбейт). Оценка пользы 0-10.
-    2. ⚖️ **ДЕТЕКТОР ЛЖИ:** - Автор утверждает: "..."
-       - А люди говорят: "..." (есть ли обман?)
-    3. 🔥 **СУТЬ (О чем видео на самом деле):** Краткий пересказ слов автора в 2 предложениях.
-    4. 👎 **КРИТИКА:** Главные претензии толпы.
+    СОСТАВЬ ОТЧЕТ (Markdown):
+    1. 🎯 **ВЕРДИКТ:** (Стоит смотреть? Оценка 0-10).
+    2. ⚖️ **ДЕТЕКТОР ПРАВДЫ:** Подтверждают ли зрители слова автора? Есть ли опровержения в комментариях?
+    3. 🔥 **ГЛАВНЫЕ СПОРЫ:** О чем самая жаркая дискуссия (особенно в ответах).
+    4. 🧠 **ВЫВОД:** Краткое резюме.
     """
     
-    # Используем модели по очереди
     models = ['gemini-2.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash', 'gemini-1.5-flash']
     
     for model in models:
@@ -104,98 +100,179 @@ def get_ai_verdict(title, transcript, comments_list):
             if response.status_code == 200:
                 return response.json()['candidates'][0]['content']['parts'][0]['text']
         except: continue
-            
-    return "⚠️ AI не справился с анализом."
+    return "⚠️ AI не ответил."
 
-# --- ПАРСИНГ ---
-def get_full_data(api_key, url):
+# --- ФУНКЦИЯ СБОРА ОТВЕТОВ (РЕКУРСИВНАЯ) ---
+def get_replies_recursive(youtube, parent_id, progress_callback):
+    replies = []
+    cost = 0
+    try:
+        req = youtube.comments().list(parentId=parent_id, part="snippet", maxResults=100)
+        while req:
+            resp = req.execute()
+            cost += 1 # +1 квота за страницу ответов
+            
+            for item in resp['items']:
+                replies.append({
+                    'Автор': item['snippet']['authorDisplayName'],
+                    'Текст': item['snippet']['textDisplay'],
+                    'Тип': 'Ответ',
+                    'Лайки': item['snippet']['likeCount']
+                })
+            
+            progress_callback(len(replies))
+            
+            if 'nextPageToken' in resp:
+                req = youtube.comments().list_next(req, resp)
+            else: break
+    except: pass
+    return replies, cost
+
+# --- ОСНОВНОЙ ПАРСЕР С СЧЕТЧИКОМ ---
+def process_full_data(api_key, url, use_deep_scan):
     youtube = build('youtube', 'v3', developerKey=api_key)
     all_data = []
     file_name = "report.xlsx"
-    title = ""
-    transcript = None
+    total_cost = 0 # СЧЕТЧИК КВОТЫ
     
+    # Элементы UI
+    status_text = st.empty()
+    bar = st.progress(0)
+
     if "v=" in url: v_id = url.split("v=")[1].split("&")[0]
     elif "youtu.be/" in url: v_id = url.split("youtu.be/")[1].split("?")[0]
-    else: return [], "", "", None
+    else: return [], "Bad Link", "", None, 0
 
     try:
-        # 1. Инфо о видео
+        # 1. Инфо о видео (+1 квота)
         vid_req = youtube.videos().list(part="snippet", id=v_id).execute()
+        total_cost += 1
+        
         if vid_req['items']:
             title = vid_req['items'][0]['snippet']['title']
             file_name = f"{re.sub(r'[^\w\s-]', '', title)[:30]}.xlsx"
+        else: return [], "Video not found", "", None, 1
         
-        # 2. Скачиваем СУБТИТРЫ (Слова автора)
+        # 2. Транскрипция (0 квоты)
         transcript = get_video_transcript(v_id)
         
-        # 3. Скачиваем КОММЕНТАРИИ (Глас народа)
-        # Берем 100 штук для быстрого анализа
-        req = youtube.commentThreads().list(part="snippet", videoId=v_id, maxResults=100)
+        # 3. Комментарии
+        req = youtube.commentThreads().list(part="snippet,replies", videoId=v_id, maxResults=100)
+        
+        fetched_count = 0
         while req:
             resp = req.execute()
+            total_cost += 1 # +1 квота за страницу тредов
+            
             for item in resp['items']:
+                # Главный коммент
                 top = item['snippet']['topLevelComment']['snippet']
                 all_data.append({
                     'Автор': top['authorDisplayName'], 
                     'Текст': top['textDisplay'],
+                    'Тип': 'Комментарий',
                     'Лайки': top['likeCount']
                 })
-            # Ограничимся 200 комментами для скорости в этом режиме
-            if len(all_data) >= 200: break
+                fetched_count += 1
+                
+                # Ответы
+                reply_count = item['snippet']['totalReplyCount']
+                if reply_count > 0:
+                    if use_deep_scan:
+                        # РЕЖИМ ПЫЛЕСОСА (Отдельные запросы)
+                        status_text.text(f"🔥 Deep Scan: Качаем ветку ({reply_count} ответов)... Квота: {total_cost}")
+                        replies, r_cost = get_replies_recursive(youtube, item['id'], lambda x: None)
+                        all_data.extend(replies)
+                        total_cost += r_cost
+                        fetched_count += len(replies)
+                    else:
+                        # ЭКОНОМ (Только то, что прилипло)
+                        if 'replies' in item:
+                            for r in item['replies']['comments']:
+                                all_data.append({
+                                    'Автор': r['snippet']['authorDisplayName'], 
+                                    'Текст': r['snippet']['textDisplay'],
+                                    'Тип': 'Ответ',
+                                    'Лайки': r['snippet']['likeCount']
+                                })
+                                fetched_count += 1
+            
+            bar.progress(min(fetched_count % 100, 100), text=f"Собрано: {fetched_count} | Потрачено квоты: {total_cost}")
+            
             if 'nextPageToken' in resp:
                 req = youtube.commentThreads().list_next(req, resp)
             else: break
-                
+            
     except Exception as e:
-        return [], f"Ошибка: {e}", "", None
-        
-    return all_data, file_name, title, transcript
+        return [], str(e), "", None, total_cost
+    
+    bar.empty()
+    status_text.empty()
+    return all_data, file_name, title, transcript, total_cost
 
 # --- ИНТЕРФЕЙС ---
-st.markdown("<h3 style='text-align: center;'>YouTube Truth Detector ⚖️</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='text-align: center;'>YouTubeComm</h3>", unsafe_allow_html=True)
 
 raw_url = st.text_input("", placeholder="Ссылка на видео...")
 
-# КНОПКА ЗАПУСКА
-col1, col2 = st.columns([1, 2])
-with col1:
-    btn = st.button("Проверить видео", type="primary", use_container_width=True)
-with col2:
-    status_box = st.empty()
+# ПАНЕЛЬ УПРАВЛЕНИЯ
+with st.container(border=True):
+    c1, c2 = st.columns(2)
+    with c1:
+        use_ai = st.toggle("🤖 Включить AI", value=False)
+    with c2:
+        deep_scan = st.toggle("☢️ Deep Scan (Все ответы)", value=False, help="Качает все ветки. Тратит много квоты!")
 
-if btn:
+# КНОПКА И СЧЕТЧИК
+btn_col, info_col = st.columns([1, 1])
+
+with btn_col:
+    start_btn = st.button("Начать работу", type="primary", use_container_width=True)
+
+with info_col:
+    # Отображение последней траты квоты
+    if st.session_state['quota_used'] > 0:
+        st.caption(f"📉 Потрачено квоты за раз: **{st.session_state['quota_used']}**")
+        st.caption(f"Остаток (примерно): **{10000 - st.session_state['quota_used']}/10000**")
+
+if start_btn:
     if not raw_url:
-        st.warning("Вставьте ссылку!")
+        st.warning("Нет ссылки!")
     else:
-        status_box.info("🕵️ Скачиваю слова автора и комментарии...")
         st.session_state['ai_verdict'] = None
+        st.session_state['processed'] = False
         
-        # Сбор данных
-        comments, fname, title, transcript = get_full_data(API_KEY, raw_url)
+        # 1. ЗАПУСК ПАРСИНГА
+        with st.spinner('Парсинг данных...'):
+            data, fname, title, transcript, cost = process_full_data(API_KEY, raw_url, deep_scan)
+            st.session_state['quota_used'] = cost # Сохраняем расход
         
-        if comments:
-            # Excel
-            df = pd.DataFrame(comments)
+        if data:
+            # 2. EXCEL
+            df = pd.DataFrame(data)
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False)
             
-            # AI Анализ
-            status_box.info("🧠 AI ищет ложь и несостыковки...")
-            verdict = get_ai_verdict(title, transcript, comments)
-            st.session_state['ai_verdict'] = verdict
+            # 3. AI АНАЛИЗ (Если включен)
+            ai_text = None
+            if use_ai:
+                with st.spinner('AI анализирует видео и комментарии...'):
+                    ai_text = get_ai_verdict(title, transcript, data, deep_scan)
+                    st.session_state['ai_verdict'] = ai_text
             
-            # Отправка
-            sent = send_to_telegram(buffer.getvalue(), fname, verdict)
+            # 4. ОТПРАВКА
+            quota_msg = f"Потрачено квоты: {cost}"
+            sent = send_to_telegram(buffer.getvalue(), fname, ai_text, quota_msg)
+            
             if sent:
-                status_box.markdown("✅ **Отчет в Telegram!**")
-            else:
-                status_box.error("Ошибка отправки в TG")
+                st.success("✅ Файл в Telegram!")
+            st.session_state['processed'] = True
+            st.rerun() # Обновляем, чтобы показать результат
         else:
-            status_box.error("Не удалось прочитать данные.")
+            st.error(f"Ошибка: {fname}")
 
-# ВЫВОД РЕЗУЛЬТАТА
-if st.session_state['ai_verdict']:
+# РЕЗУЛЬТАТ (Остается на экране)
+if st.session_state['processed'] and st.session_state['ai_verdict']:
     st.divider()
     st.markdown(st.session_state['ai_verdict'])

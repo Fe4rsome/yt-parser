@@ -4,9 +4,10 @@ from googleapiclient.discovery import build
 import io
 import re
 import requests
+import time
 
 # --- НАСТРОЙКИ ---
-st.set_page_config(page_title="YouTube AI Analyst", page_icon="🚀", layout="centered")
+st.set_page_config(page_title="YouTube AI Analyst", page_icon="🇺🇸", layout="centered")
 
 # --- СЕКРЕТЫ ---
 try:
@@ -18,9 +19,25 @@ except Exception as e:
     st.error(f"Ошибка Secrets: {e}")
     st.stop()
 
+# --- ФУНКЦИЯ ПРОВЕРКИ МОДЕЛИ (ТЕСТ-ДРАЙВ) ---
+def test_model(api_key, model_name):
+    """Пробует отправить 'Hello' модели. Возвращает True, если работает."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent?key={api_key}"
+    try:
+        response = requests.post(
+            url, 
+            json={"contents": [{"parts": [{"text": "Hello"}]}]}, 
+            headers={"Content-Type": "application/json"}
+        )
+        if response.status_code == 200:
+            return True
+        return False
+    except:
+        return False
+
 # --- УМНЫЙ ПОИСК МОДЕЛИ ---
-def find_best_model(api_key):
-    """Ищет самую новую доступную модель (Gemini 3 -> 2 -> 1.5 Pro)"""
+def find_working_model(api_key):
+    """Ищет лучшую РАБОЧУЮ модель (проверяет квоты)"""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
     try:
         response = requests.get(url)
@@ -28,23 +45,34 @@ def find_best_model(api_key):
             return None, f"Ошибка API: {response.status_code}"
             
         data = response.json()
-        # Фильтруем только те, что умеют генерировать текст
         all_models = [m['name'] for m in data.get('models', []) if 'generateContent' in m.get('supportedGenerationMethods', [])]
         
         if not all_models: return None, "Список моделей пуст"
 
-        # ПРИОРИТЕТЫ (Сначала ищем самые мощные)
-        # Если выйдет Gemini 3, он подхватится первым
-        priority_keywords = ['gemini-3', 'gemini-2', 'gemini-1.5-pro', 'flash']
+        # ПРИОРИТЕТЫ: Проверяем от самых крутых к простым
+        # Мы убрали gemini-3 из топа, так как на него часто квота 0, но оставили gemini-2.0
+        priorities = [
+            'gemini-2.0-flash', 
+            'gemini-1.5-pro', 
+            'gemini-1.5-flash'
+        ]
         
-        for keyword in priority_keywords:
-            # Ищем модель, в названии которой есть ключевое слово
-            found = next((m for m in all_models if keyword in m), None)
-            if found:
-                return found, None # Возвращаем лучшую найденную
+        # 1. Сначала ищем по приоритетам и ТЕСТИРУЕМ
+        for keyword in priorities:
+            # Находим все версии модели (например, gemini-1.5-pro-latest, gemini-1.5-pro-001)
+            candidates = [m for m in all_models if keyword in m]
+            
+            for model in candidates:
+                # ВАЖНО: Делаем реальный тест перед выбором!
+                if test_model(api_key, model):
+                    return model, None
         
-        # Если ничего из приоритетов не нашли, берем первую попавшуюся
-        return all_models[0], None
+        # 2. Если ничего из топа не заработало, берем любую рабочую из списка
+        for model in all_models:
+             if "gemini" in model and test_model(api_key, model):
+                 return model, None
+
+        return None, "Ни одна модель не прошла тест (квоты исчерпаны?)"
         
     except Exception as e:
         return None, f"Ошибка сети: {e}"
@@ -53,60 +81,58 @@ def find_best_model(api_key):
 def get_ai_summary(comments_list, model_name):
     if not comments_list: return "Нет данных."
     
-    # Берем больше контекста для мощных моделей
     text_corpus = "\n".join([str(c['Текст'])[:500] for c in comments_list[:80]])
     
     prompt = f"""
-    Ты профессиональный аналитик медиа. Проанализируй комментарии.
-    Дай развернутый отчет на русском языке (используй Markdown):
+    Ты профессиональный аналитик. Проанализируй комментарии YouTube.
+    Составь подробный отчет на русском языке:
     
-    1. 🎭 **Эмоциональный климат:** Детальное описание настроения.
-    2. 🔥 **Острые темы:** О чем самые жаркие споры?
-    3. 👍 **Позитив:** Что именно хвалят (цитаты/факты).
-    4. 👎 **Негатив:** Конкретные претензии.
-    5. 🧠 **Вывод:** Стоит ли автору что-то менять?
+    1. 🎭 **Настроение:** (Эмоции, сарказм, агрессия).
+    2. 🔥 **О чем спорят:** (Главные темы).
+    3. 👍 **Позитив:** (Что хвалят).
+    4. 👎 **Негатив:** (Что ругают).
+    5. 🧠 **Вывод:** (Краткий итог).
     
     Текст: {text_corpus}
     """
     
-    # model_name уже содержит "models/..."
     url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent?key={GEMINI_KEY}"
     
     try:
         response = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, headers={"Content-Type": "application/json"})
         if response.status_code == 200:
             return response.json()['candidates'][0]['content']['parts'][0]['text']
+        elif response.status_code == 429:
+            return "⚠️ Превышен лимит запросов (Quota Exceeded). Попробуйте через минуту."
         return f"Ошибка генерации ({response.status_code}): {response.text}"
     except Exception as e:
         return f"Сбой: {e}"
 
-# --- ОТПРАВКА В TELEGRAM (ИСПРАВЛЕННАЯ) ---
+# --- ОТПРАВКА В TELEGRAM ---
 def send_full_report_to_telegram(file_data, file_name, ai_text):
-    # 1. Сначала отправляем ФАЙЛ
-    url_doc = f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument"
+    # Файл
     try:
         requests.post(
-            url_doc, 
-            data={'chat_id': TG_CHAT_ID, 'caption': f"📂 Данные: {file_name}"}, 
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument", 
+            data={'chat_id': TG_CHAT_ID, 'caption': f"📂 Отчет: {file_name}"}, 
             files={'document': (file_name, file_data)}
         )
     except: pass
     
-    # 2. Затем отправляем ТЕКСТ (отдельным сообщением, чтобы влезло всё)
+    # Текст (разбиваем, если длинный)
     url_msg = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
-        # Разбиваем на части, если вдруг текст больше 4000 символов (редко, но бывает)
+        # Если текст слишком длинный для одного сообщения Telegram
         if len(ai_text) > 4000:
-            ai_text = ai_text[:4000] + "\n...(обрезано Telegram)..."
-            
-        requests.post(
-            url_msg, 
-            json={'chat_id': TG_CHAT_ID, 'text': ai_text, 'parse_mode': 'Markdown'}
-        )
-        return True
-    except: return False
+            part1 = ai_text[:4000]
+            part2 = ai_text[4000:]
+            requests.post(url_msg, json={'chat_id': TG_CHAT_ID, 'text': part1, 'parse_mode': 'Markdown'})
+            requests.post(url_msg, json={'chat_id': TG_CHAT_ID, 'text': part2, 'parse_mode': 'Markdown'})
+        else:
+            requests.post(url_msg, json={'chat_id': TG_CHAT_ID, 'text': ai_text, 'parse_mode': 'Markdown'})
+    except: pass
 
-# --- ПАРСИНГ YOUTUBE ---
+# --- ПАРСИНГ ---
 def get_video_id(url):
     if "v=" in url: return url.split("v=")[1].split("&")[0]
     elif "youtu.be/" in url: return url.split("youtu.be/")[1].split("?")[0]
@@ -137,15 +163,18 @@ def process_videos(api_key, urls):
     return all_data, file_name
 
 # --- ИНТЕРФЕЙС ---
-st.title("YouTube AI Analyst 3.0 🚀")
+st.title("YouTube AI Analyst 🇺🇸")
 
-# ДИАГНОСТИКА
-with st.expander("🔌 Статус подключения", expanded=True):
-    active_model, error = find_best_model(GEMINI_KEY)
+# ДИАГНОСТИКА С ТЕСТОМ
+with st.expander("📡 Поиск рабочей модели...", expanded=True):
+    with st.spinner("Тестируем модели на квоты..."):
+        active_model, error = find_working_model(GEMINI_KEY)
+    
     if active_model:
-        st.success(f"✅ Используем мощнейшую доступную модель: **{active_model}**")
+        st.success(f"✅ Найдена рабочая модель: **{active_model}**")
+        st.caption("Модели с ошибкой 429 были пропущены.")
     else:
-        st.error(f"❌ Ошибка: {error}")
+        st.error(f"❌ Не удалось найти рабочую модель: {error}")
 
 raw_urls = st.text_area("Ссылка на видео:", height=100)
 
@@ -153,11 +182,11 @@ if st.button("Анализировать", type="primary", disabled=(not active_
     if not raw_urls:
         st.warning("Вставьте ссылку")
     else:
-        with st.spinner('Читаю комментарии и думаю...'):
+        with st.spinner('Анализирую...'):
             data, fname = process_videos(API_KEY, raw_urls.split('\n'))
         
         if data:
-            st.subheader("📝 Результат анализа")
+            st.subheader("📝 Результат")
             summary = get_ai_summary(data, active_model)
             st.markdown(summary)
             
@@ -169,5 +198,5 @@ if st.button("Анализировать", type="primary", disabled=(not active_
             
             # Отправка
             send_full_report_to_telegram(buffer.getvalue(), fname, summary)
-            st.success("✅ Отчет и файл отправлены в Telegram!")
+            st.success("✅ Все отправлено в Telegram!")
             st.download_button("Скачать Excel", buffer.getvalue(), fname)

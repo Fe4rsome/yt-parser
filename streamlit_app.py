@@ -3,8 +3,8 @@ import pandas as pd
 from googleapiclient.discovery import build
 import io
 import re
-import requests
-import google.generativeai as genai
+import requests # Используем стандартную библиотеку запросов
+# import google.generativeai - БОЛЬШЕ НЕ НУЖНО
 
 # --- НАСТРОЙКИ СТРАНИЦЫ ---
 st.set_page_config(page_title="YouTube AI Parser", page_icon="🧠", layout="centered")
@@ -19,75 +19,49 @@ except Exception as e:
     st.error(f"Ошибка в Secrets: {e}")
     st.stop()
 
-# --- НАСТРОЙКА GEMINI (С реальной проверкой связи) ---
-genai.configure(api_key=GEMINI_KEY)
-
-# Добавили 'gemini-pro' как запасной вариант, если Flash недоступен
-model_names = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-pro']
-ai_model = None
-
-for name in model_names:
-    try:
-        print(f"Тестирую модель: {name}...")
-        test_model = genai.GenerativeModel(name)
-        # ВАЖНО: Делаем тестовый запрос. Если библиотека старая или модель недоступна - тут вылетит ошибка
-        test_model.generate_content("Hello")
-        
-        ai_model = test_model
-        print(f"✅ Успешно подключились к: {name}")
-        break
-    except Exception as e:
-        print(f"❌ Модель {name} не ответила: {e}")
-        continue
-
-if ai_model is None:
-    st.error("Не удалось подключиться к моделям. Пожалуйста, обновите страницу через минуту (идет переустановка библиотек).")
-    st.stop()
-    
 # --- ФУНКЦИИ ---
 
 def get_ai_summary(comments_list):
-    """Улучшенная генерация сводки с защитой от ошибок"""
+    """Прямой запрос к Gemini через HTTP (работает всегда)"""
+    if not comments_list:
+        return "Нет данных для анализа."
+
+    # Подготовка текста (берем первые 50 комментов)
+    text_corpus = "\n".join([str(c['Текст'])[:300] for c in comments_list[:50]])
+    
+    prompt = f"""
+    Проанализируй эти комментарии к видео и напиши кратко:
+    1. Общее настроение.
+    2. Основные темы.
+    3. Что хвалят/ругают.
+    
+    Текст:
+    {text_corpus}
+    """
+    
+    # ПРЯМОЙ ЗАПРОС К API (МИНУЯ БИБЛИОТЕКУ)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}]
+    }
+    
     try:
-        if not comments_list:
-            return "Нет комментариев для анализа."
+        response = requests.post(url, json=payload, headers=headers)
         
-        # Берем только текст, чистим от лишних пробелов и берем первые 50 штук
-        text_corpus = "\n".join([str(c['Текст'])[:300] for c in comments_list[:50]]) 
-        
-        prompt = f"""
-        Проанализируй эти комментарии к видео и напиши кратко:
-        1. Общее настроение аудитории.
-        2. Основные темы (о чем говорят).
-        3. Что хвалят, а что ругают.
-        
-        Текст комментариев:
-        {text_corpus}
-        """
-        
-        # Настройка: просим AI быть менее строгим к фильтрам безопасности
-        response = ai_model.generate_content(
-            prompt,
-            safety_settings={
-                "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
-                "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
-                "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
-                "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
-            }
-        )
-        
-        if response.text:
-            return response.text
-        return "Gemini вернул пустой ответ (возможно, сработал фильтр безопасности Google)."
-        
+        if response.status_code == 200:
+            # Парсим ответ JSON вручную
+            return response.json()['candidates'][0]['content']['parts'][0]['text']
+        else:
+            # Если ошибка - выводим точный текст от Google (поможет понять причину)
+            return f"Ошибка Google API ({response.status_code}): {response.text}"
+            
     except Exception as e:
-        # Это поможет нам увидеть реальную причину в интерфейсе
-        return f"Ошибка AI: {str(e)}"
+        return f"Сбой соединения: {e}"
 
 def send_to_telegram(file_data, file_name, ai_text):
-    """Отправка файла и сводки в Telegram"""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument"
-    caption = f"📊 **AI Анализ:**\n{ai_text[:900]}" # Ограничение длины подписи
+    caption = f"📊 **AI Анализ:**\n{ai_text[:900]}"
     files = {'document': (file_name, file_data)}
     try:
         requests.post(url, data={'chat_id': TG_CHAT_ID, 'caption': caption, 'parse_mode': 'Markdown'}, files=files)
@@ -95,6 +69,7 @@ def send_to_telegram(file_data, file_name, ai_text):
     except:
         return False
 
+# --- СТАНДАРТНЫЕ ФУНКЦИИ YOUTUBE ---
 def get_video_id(url):
     url = url.strip()
     if "v=" in url: return url.split("v=")[1].split("&")[0]
@@ -119,7 +94,7 @@ def process_videos(api_key, urls):
         if not v_id: continue
         if i == 0:
             title = get_video_title(youtube, v_id)
-            file_name = f"{re.sub(r'[\\/*? Glad:<>|]', '', title)[:50]}.xlsx"
+            file_name = f"{re.sub(r'[\\/*?<>|]', '', title)[:50]}.xlsx"
         
         try:
             req = youtube.commentThreads().list(part="snippet,replies", videoId=v_id, maxResults=100)
@@ -146,24 +121,21 @@ if st.button("Начать сбор и AI-анализ", type="primary"):
             data, logs, fname = process_videos(API_KEY, urls)
         
         if data:
-            # Вывод AI сводки
             st.subheader("🤖 Сводка от Gemini AI")
             ai_summary = get_ai_summary(data)
-            st.info(ai_summary)
             
-            # Подготовка файла
+            # Если вернулась ошибка 400/403, показываем её красным
+            if "Ошибка Google API" in ai_summary:
+                st.error(ai_summary)
+            else:
+                st.info(ai_summary)
+            
             df = pd.DataFrame(data)
             df['Текст'] = df['Текст'].astype(str).str.replace(r'<[^>]*>', ' ', regex=True)
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False)
             
-            # Отправка в ТГ и кнопка
             send_to_telegram(buffer.getvalue(), fname, ai_summary)
-            st.success("Данные собраны и отправлены в Telegram!")
+            st.success("Готово! Проверьте Telegram.")
             st.download_button(f"📥 Скачать {fname}", buffer.getvalue(), fname)
-
-
-
-
-

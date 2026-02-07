@@ -2,3 +2,5 @@ streamlit
 google-api-python-client
 pandas
 openpyxl
+google-generativeai
+requests

@@ -19,7 +19,7 @@ except Exception as e:
     st.error(f"Ошибка Secrets: {e}")
     st.stop()
 
-# --- ПАМЯТЬ ---
+# --- ПАМЯТЬ СЕССИИ ---
 if 'processed' not in st.session_state: st.session_state['processed'] = False
 if 'excel_data' not in st.session_state: st.session_state['excel_data'] = None
 if 'file_name' not in st.session_state: st.session_state['file_name'] = ""
@@ -30,7 +30,7 @@ def send_results_to_telegram(file_data, file_name, ai_text=None):
     try:
         # 1. Файл
         caption = f"📂 {file_name}"
-        if ai_text: caption += "\n\n(Полный отчет — следующим сообщением)"
+        if ai_text: caption += "\n\n(Отчет AI — следующим сообщением)"
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument", 
             data={'chat_id': TG_CHAT_ID, 'caption': caption}, 
@@ -51,8 +51,8 @@ def send_results_to_telegram(file_data, file_name, ai_text=None):
 def get_ai_summary(comments_list):
     if not comments_list: return "Нет данных.", None
     
-    # Берем больше контекста (первые 120 комментов)
-    text_corpus = "\n".join([str(c['Текст'])[:400] for c in comments_list[:120]])
+    # Берем больше контекста (150 комментов)
+    text_corpus = "\n".join([str(c['Текст'])[:400] for c in comments_list[:150]])
     
     prompt = f"""
     Проанализируй комментарии YouTube.
@@ -87,10 +87,11 @@ def get_ai_summary(comments_list):
             
     return f"⚠️ Ошибка AI: {last_error}", None
 
-# --- ФУНКЦИЯ: ПОЛУЧИТЬ ВСЕ ОТВЕТЫ (ЯДЕРНЫЙ РЕЖИМ) ---
+# --- ФУНКЦИЯ "ПЫЛЕСОС" (Скачивает все ответы) ---
 def get_all_replies(youtube, parent_id):
     replies = []
     try:
+        # Качаем страницы с ответами, пока они есть
         req = youtube.comments().list(parentId=parent_id, part="snippet", maxResults=100)
         while req:
             resp = req.execute()
@@ -101,7 +102,6 @@ def get_all_replies(youtube, parent_id):
                     'Тип': 'Ответ',
                     'Лайки': item['snippet']['likeCount']
                 })
-            # Проверяем, есть ли следующая страница ответов
             if 'nextPageToken' in resp:
                 req = youtube.comments().list_next(req, resp)
             else:
@@ -115,9 +115,9 @@ def process_videos(api_key, urls, deep_scan=False):
     all_data = []
     file_name = "comments.xlsx"
     
-    # Прогресс-бар для визуализации
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    # Элементы интерфейса для отображения прогресса
+    progress_text = "Инициализация..."
+    my_bar = st.progress(0, text=progress_text)
     
     for i, url in enumerate(urls):
         if "v=" in url: v_id = url.split("v=")[1].split("&")[0]
@@ -130,15 +130,14 @@ def process_videos(api_key, urls, deep_scan=False):
                 title = vid_req['items'][0]['snippet']['title']
                 file_name = f"{re.sub(r'[^\w\s-]', '', title)[:30]}.xlsx"
             
-            # Запрашиваем треды
+            # Запрос основных веток
             req = youtube.commentThreads().list(part="snippet,replies", videoId=v_id, maxResults=100)
             
-            total_fetched = 0
-            
+            count = 0
             while req:
                 resp = req.execute()
                 for item in resp['items']: 
-                    # 1. Главный комментарий
+                    # Главный коммент
                     top = item['snippet']['topLevelComment']['snippet']
                     all_data.append({
                         'Автор': top['authorDisplayName'], 
@@ -146,20 +145,19 @@ def process_videos(api_key, urls, deep_scan=False):
                         'Тип': 'Комментарий',
                         'Лайки': top['likeCount']
                     })
-                    total_fetched += 1
+                    count += 1
                     
-                    # 2. Работа с ответами
+                    # ОТВЕТЫ
                     reply_count = item['snippet']['totalReplyCount']
-                    
                     if reply_count > 0:
                         if deep_scan:
-                            # РЕЖИМ "ЯДЕРНЫЙ": Качаем всё отдельным запросом
-                            # Это тратит квоту, но достает все ответы
+                            # РЕЖИМ ЯДЕРНЫЙ: Качаем всё
+                            my_bar.progress(0, text=f"🔥 Качаем {reply_count} ответов ветки...")
                             replies = get_all_replies(youtube, item['id'])
                             all_data.extend(replies)
-                            total_fetched += len(replies)
+                            count += len(replies)
                         else:
-                            # РЕЖИМ "ЭКОНОМ": Берем только то, что дали сразу (до 5 шт)
+                            # ОБЫЧНЫЙ: Берем то, что дали сразу
                             if 'replies' in item:
                                 for reply in item['replies']['comments']:
                                     all_data.append({
@@ -168,34 +166,34 @@ def process_videos(api_key, urls, deep_scan=False):
                                         'Тип': 'Ответ',
                                         'Лайки': reply['snippet']['likeCount']
                                     })
-                                    total_fetched += 1
-
-                # Обновляем статус
-                status_text.text(f"Собрано: {total_fetched}...")
+                                    count += 1
+                
+                my_bar.progress(50, text=f"Собрано сообщений: {count}...")
                 
                 if 'nextPageToken' in resp:
                     req = youtube.commentThreads().list_next(req, resp)
                 else:
                     break
-        except Exception as e:
-            st.error(f"Ошибка API: {e}")
-            
-    progress_bar.empty()
-    status_text.empty()
+        except: pass
+        
+    my_bar.empty()
     return all_data, file_name
 
 # --- ИНТЕРФЕЙС ---
+
 st.markdown("<h3 style='text-align: center; margin-bottom: 10px;'>YouTubeComm</h3>", unsafe_allow_html=True)
 
 raw_urls = st.text_area("Ссылка:", height=100)
 
-# НАСТРОЙКИ (В ДВЕ КОЛОНКИ)
-c1, c2 = st.columns(2)
-with c1:
-    use_ai = st.toggle("AI-анализ", value=False)
-with c2:
-    # ТОТ САМЫЙ ПОЛЗУНОК
-    deep_scan = st.toggle("🔥 Все ответы (Медленно!)", value=False, help="Выгружает ВСЕ ветки ответов. Тратит много квоты.")
+# БЛОК НАСТРОЕК (В РАМКЕ)
+with st.container(border=True):
+    col1, col2 = st.columns(2)
+    with col1:
+        # Тумблер AI
+        use_ai = st.toggle("🤖 AI-анализ", value=False)
+    with col2:
+        # Тумблер ЯДЕРНЫЙ
+        deep_scan = st.toggle("☢️ Все ответы", value=False, help="Собирает ВСЕ ответы. Долго и тратит квоту!")
 
 # КНОПКА ЗАПУСКА
 if st.button("Начать работу", type="primary", use_container_width=True):
@@ -204,8 +202,7 @@ if st.button("Начать работу", type="primary", use_container_width=Tr
     else:
         st.session_state['processed'] = False
         
-        with st.spinner('Сбор данных (это может занять время)...'):
-            # Передаем параметр deep_scan
+        with st.spinner('Парсинг данных...'):
             data, fname = process_videos(API_KEY, raw_urls.split('\n'), deep_scan=deep_scan)
         
         if data:
@@ -213,37 +210,3 @@ if st.button("Начать работу", type="primary", use_container_width=Tr
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False)
-            
-            st.session_state['excel_data'] = buffer.getvalue()
-            st.session_state['file_name'] = fname
-            st.session_state['ai_text'] = None
-            
-            if use_ai:
-                with st.spinner('Анализ...'):
-                    summary, mod = get_ai_summary(data)
-                    st.session_state['ai_text'] = summary
-
-            st.session_state['processed'] = True
-            
-            # Отправка
-            send_results_to_telegram(st.session_state['excel_data'], fname, st.session_state['ai_text'])
-
-# БЛОК РЕЗУЛЬТАТОВ
-if st.session_state['processed']:
-    st.divider()
-    
-    st.info(f"✅ Готово! Собрано записей: {len(pd.read_excel(io.BytesIO(st.session_state['excel_data'])))}")
-    
-    if st.session_state['ai_text']:
-        if "Ошибка" in st.session_state['ai_text']:
-            st.error(st.session_state['ai_text'])
-        else:
-            st.markdown(st.session_state['ai_text'])
-    
-    st.download_button(
-        label=f"📥 Скачать таблицу",
-        data=st.session_state['excel_data'],
-        file_name=st.session_state['file_name'],
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True
-    )

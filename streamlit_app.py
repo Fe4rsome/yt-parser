@@ -52,7 +52,7 @@ def get_video_transcript(video_id):
         return " ".join([t['text'] for t in transcript_list])
     except: return None
 
-# --- AI АНАЛИЗ ---
+# --- AI АНАЛИЗАТОР (СТРОГИЙ РЕЖИМ) ---
 def get_ai_verdict(title, transcript, comments_list, is_deep_scan):
     if not comments_list: return "Нет комментариев."
     
@@ -62,28 +62,43 @@ def get_ai_verdict(title, transcript, comments_list, is_deep_scan):
     audience_voice = "\n".join([f"- {str(c['Текст'])[:300]}" for c in comments_list[:limit]])
     
     prompt = f"""
-    Роль: Ты критический аналитик YouTube. 
-    Задача: Сравни содержание видео (слова автора) с реакцией зрителей.
+    Роль: Ты строгий, беспристрастный аналитик данных. Твоя задача — дать объективную оценку видео.
     
     1. ИНФОРМАЦИЯ О ВИДЕО:
     Название: {title}
     Слова автора: {transcript_text}...
     
-    2. КОММЕНТАРИИ ({limit} шт):
+    2. КОММЕНТАРИИ ЗРИТЕЛЕЙ (Выборка {limit} шт):
     {audience_voice}
     
+    ИНСТРУКЦИЯ:
+    Проанализируй тональность. Игнорируй единичные всплески эмоций, ищи общий тренд.
+    
     ОТЧЕТ (Markdown):
-    1. 🎯 ВЕРДИКТ (0-10).
+    1. 🎯 ВЕРДИКТ (Оценка 0-10, где 0 - мусор/обман, 10 - шедевр/польза). Будь строг.
     2. ⚖️ ДЕТЕКТОР ПРАВДЫ (Ложь vs Истина).
     3. 🔥 ГЛАВНЫЕ СПОРЫ.
     4. 🧠 ВЫВОД.
     """
     
-    models = ['gemini-2.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash', 'gemini-1.5-flash']
+    # Сначала пробуем самую умную (Pro), потом быстрые
+    models = ['gemini-1.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash']
+    
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
         try:
-            response = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, headers={"Content-Type": "application/json"})
+            # ДОБАВЛЕН КОНФИГ ТЕМПЕРАТУРЫ = 0
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.0,
+                    "topP": 0.8,
+                    "topK": 40
+                }
+            }
+            
+            response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
+            
             if response.status_code == 200:
                 return response.json()['candidates'][0]['content']['parts'][0]['text']
         except: continue
@@ -224,3 +239,4 @@ if start_btn:
 if st.session_state['processed'] and st.session_state['ai_verdict']:
     st.divider()
     st.markdown(st.session_state['ai_verdict'])
+

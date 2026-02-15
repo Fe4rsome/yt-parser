@@ -7,7 +7,7 @@ import re
 import requests
 
 # --- НАСТРОЙКИ ---
-st.set_page_config(page_title="YouTubeComm", page_icon="📡", layout="centered")
+st.set_page_config(page_title="YouTubeComm", page_icon="🩳", layout="centered")
 
 # --- СЕКРЕТЫ ---
 try:
@@ -52,7 +52,7 @@ def get_video_transcript(video_id):
         return " ".join([t['text'] for t in transcript_list])
     except: return None
 
-# --- AI АНАЛИЗАТОР (СТРОГИЙ РЕЖИМ) ---
+# --- AI АНАЛИЗ (ТЕМПЕРАТУРА 0) ---
 def get_ai_verdict(title, transcript, comments_list, is_deep_scan):
     if not comments_list: return "Нет комментариев."
     
@@ -62,47 +62,47 @@ def get_ai_verdict(title, transcript, comments_list, is_deep_scan):
     audience_voice = "\n".join([f"- {str(c['Текст'])[:300]}" for c in comments_list[:limit]])
     
     prompt = f"""
-    Роль: Ты строгий, беспристрастный аналитик данных. Твоя задача — дать объективную оценку видео.
+    Роль: Ты строгий аналитик. Сравни контент видео (Shorts/Video) с реакцией.
     
-    1. ИНФОРМАЦИЯ О ВИДЕО:
+    ВИДЕО:
     Название: {title}
     Слова автора: {transcript_text}...
     
-    2. КОММЕНТАРИИ ЗРИТЕЛЕЙ (Выборка {limit} шт):
+    КОММЕНТАРИИ ({limit} шт):
     {audience_voice}
     
-    ИНСТРУКЦИЯ:
-    Проанализируй тональность. Игнорируй единичные всплески эмоций, ищи общий тренд.
-    
     ОТЧЕТ (Markdown):
-    1. 🎯 ВЕРДИКТ (Оценка 0-10, где 0 - мусор/обман, 10 - шедевр/польза). Будь строг.
+    1. 🎯 ВЕРДИКТ (0-10).
     2. ⚖️ ДЕТЕКТОР ПРАВДЫ (Ложь vs Истина).
     3. 🔥 ГЛАВНЫЕ СПОРЫ.
     4. 🧠 ВЫВОД.
     """
     
-    # Сначала пробуем самую умную (Pro), потом быстрые
     models = ['gemini-1.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash']
-    
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
         try:
-            # ДОБАВЛЕН КОНФИГ ТЕМПЕРАТУРЫ = 0
+            # ТЕМПЕРАТУРА 0 ДЛЯ СТАБИЛЬНОСТИ
             payload = {
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.0,
-                    "topP": 0.8,
-                    "topK": 40
-                }
+                "generationConfig": {"temperature": 0.0}
             }
-            
             response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
-            
             if response.status_code == 200:
                 return response.json()['candidates'][0]['content']['parts'][0]['text']
         except: continue
     return "⚠️ AI не ответил."
+
+# --- УНИВЕРСАЛЬНЫЙ ПОИСК ID (SHORTS FIX) ---
+def extract_video_id(url):
+    url = url.strip()
+    if "shorts/" in url:
+        return url.split("shorts/")[1].split("?")[0]
+    elif "v=" in url:
+        return url.split("v=")[1].split("&")[0]
+    elif "youtu.be/" in url:
+        return url.split("youtu.be/")[1].split("?")[0]
+    return None
 
 # --- СБОР ОТВЕТОВ ---
 def get_replies_recursive(youtube, parent_id, progress_callback):
@@ -136,9 +136,9 @@ def process_full_data(api_key, url, use_deep_scan):
     status_text = st.empty()
     bar = st.progress(0)
 
-    if "v=" in url: v_id = url.split("v=")[1].split("&")[0]
-    elif "youtu.be/" in url: v_id = url.split("youtu.be/")[1].split("?")[0]
-    else: return [], "Bad Link", "", None, 0
+    # ИСПОЛЬЗУЕМ НОВУЮ ФУНКЦИЮ
+    v_id = extract_video_id(url)
+    if not v_id: return [], "Некорректная ссылка (нужен YouTube)", "", None, 0
 
     try:
         vid_req = youtube.videos().list(part="snippet", id=v_id).execute()
@@ -185,23 +185,19 @@ def process_full_data(api_key, url, use_deep_scan):
 # --- ИНТЕРФЕЙС ---
 st.markdown("<h3 style='text-align: center;'>YouTubeComm</h3>", unsafe_allow_html=True)
 
-# ССЫЛКА НА КОНСОЛЬ (КНОПКА ВВЕРХУ)
-st.link_button("📊 Проверить остаток квоты в Google Console", "https://console.cloud.google.com/apis/api/youtube.googleapis.com/quotas")
+st.link_button("📊 Проверить остаток квоты", "https://console.cloud.google.com/apis/api/youtube.googleapis.com/quotas")
 
-raw_url = st.text_input("", placeholder="Ссылка на видео...")
+raw_url = st.text_input("", placeholder="Ссылка на видео или Shorts...")
 
-# НАСТРОЙКИ
 with st.container(border=True):
     c1, c2 = st.columns(2)
     with c1: use_ai = st.toggle("🤖 Включить AI", value=False)
     with c2: deep_scan = st.toggle("☢️ Deep Scan", value=False, help="Качает все ответы.")
 
-# КНОПКА И ИНФО
 btn_col, info_col = st.columns([1.2, 0.8])
 with btn_col:
     start_btn = st.button("Начать работу", type="primary", use_container_width=True)
 with info_col:
-    # ИНДИКАТОР ПОТРАЧЕННОГО ЗА СЕССИЮ
     if st.session_state['quota_used'] > 0:
         st.metric(label="Потрачено за раз", value=f"{st.session_state['quota_used']} ед.", delta=f"-{st.session_state['quota_used']}")
     else:
@@ -239,4 +235,3 @@ if start_btn:
 if st.session_state['processed'] and st.session_state['ai_verdict']:
     st.divider()
     st.markdown(st.session_state['ai_verdict'])
-

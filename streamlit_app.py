@@ -50,7 +50,7 @@ def get_video_transcript(video_id):
     try:
         transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'en'])
         return " ".join([t['text'] for t in transcript_list])
-    except: return None
+    except: return ""
 
 # --- AI АНАЛИЗ (ТЕМПЕРАТУРА 0) ---
 def get_ai_verdict(title, transcript, comments_list, is_deep_scan):
@@ -62,10 +62,10 @@ def get_ai_verdict(title, transcript, comments_list, is_deep_scan):
     audience_voice = "\n".join([f"- {str(c['Текст'])[:300]}" for c in comments_list[:limit]])
     
     prompt = f"""
-    Роль: Ты строгий аналитик. Сравни контент видео (Shorts/Video) с реакцией.
+    Роль: Ты строгий аналитик. Сравни контент видео (одного или нескольких) с реакцией аудитории.
     
     ВИДЕО:
-    Название: {title}
+    Названия: {title}
     Слова автора: {transcript_text}...
     
     КОММЕНТАРИИ ({limit} шт):
@@ -82,7 +82,6 @@ def get_ai_verdict(title, transcript, comments_list, is_deep_scan):
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
         try:
-            # ТЕМПЕРАТУРА 0 ДЛЯ СТАБИЛЬНОСТИ
             payload = {
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {"temperature": 0.0}
@@ -105,7 +104,7 @@ def extract_video_id(url):
     return None
 
 # --- СБОР ОТВЕТОВ ---
-def get_replies_recursive(youtube, parent_id, progress_callback):
+def get_replies_recursive(youtube, parent_id, progress_callback, video_title):
     replies = []
     cost = 0
     try:
@@ -115,6 +114,7 @@ def get_replies_recursive(youtube, parent_id, progress_callback):
             cost += 1 
             for item in resp['items']:
                 replies.append({
+                    'Видео': video_title, # ДОБАВЛЕН ЗАГОЛОВОК ВИДЕО
                     'Автор': item['snippet']['authorDisplayName'],
                     'Текст': item['snippet']['textDisplay'],
                     'Тип': 'Ответ',
@@ -126,68 +126,103 @@ def get_replies_recursive(youtube, parent_id, progress_callback):
     except: pass
     return replies, cost
 
-# --- ПАРСЕР ---
-def process_full_data(api_key, url, use_deep_scan):
+# --- МАССОВЫЙ ПАРСЕР ---
+def process_multiple_videos(api_key, raw_urls, use_deep_scan):
     youtube = build('youtube', 'v3', developerKey=api_key)
     all_data = []
-    file_name = "report.xlsx"
+    first_file_name = "report.xlsx"
+    combined_titles = ""
+    combined_transcripts = ""
     total_cost = 0 
     
     status_text = st.empty()
     bar = st.progress(0)
 
-    # ИСПОЛЬЗУЕМ НОВУЮ ФУНКЦИЮ
-    v_id = extract_video_id(url)
-    if not v_id: return [], "Некорректная ссылка (нужен YouTube)", "", None, 0
-
-    try:
-        vid_req = youtube.videos().list(part="snippet", id=v_id).execute()
-        total_cost += 1
-        if vid_req['items']:
-            title = vid_req['items'][0]['snippet']['title']
-            file_name = f"{re.sub(r'[^\w\s-]', '', title)[:30]}.xlsx"
-        else: return [], "Video not found", "", None, 1
-        
-        transcript = get_video_transcript(v_id)
-        
-        req = youtube.commentThreads().list(part="snippet,replies", videoId=v_id, maxResults=100)
-        fetched_count = 0
-        while req:
-            resp = req.execute()
-            total_cost += 1 
-            for item in resp['items']:
-                top = item['snippet']['topLevelComment']['snippet']
-                all_data.append({'Автор': top['authorDisplayName'], 'Текст': top['textDisplay'], 'Тип': 'Комментарий', 'Лайки': top['likeCount']})
-                fetched_count += 1
-                
-                if item['snippet']['totalReplyCount'] > 0:
-                    if use_deep_scan:
-                        status_text.text(f"🔥 Deep Scan... Квота: {total_cost}")
-                        replies, r_cost = get_replies_recursive(youtube, item['id'], lambda x: None)
-                        all_data.extend(replies)
-                        total_cost += r_cost
-                        fetched_count += len(replies)
-                    elif 'replies' in item:
-                        for r in item['replies']['comments']:
-                            all_data.append({'Автор': r['snippet']['authorDisplayName'], 'Текст': r['snippet']['textDisplay'], 'Тип': 'Ответ', 'Лайки': r['snippet']['likeCount']})
-                            fetched_count += 1
-            
-            bar.progress(min(fetched_count % 100, 100), text=f"Собрано: {fetched_count} | Квота: {total_cost}")
-            if 'nextPageToken' in resp: req = youtube.commentThreads().list_next(req, resp)
-            else: break
-            
-    except Exception as e: return [], str(e), "", None, total_cost
+    # Разбиваем ссылки по переносу строки
+    url_list = [u.strip() for u in raw_urls.split('\n') if u.strip()]
     
+    if not url_list:
+        return [], "Нет ссылок", "", "", 0
+
+    for index, url in enumerate(url_list):
+        v_id = extract_video_id(url)
+        if not v_id: 
+            continue # Пропускаем битые ссылки
+
+        try:
+            status_text.text(f"Обработка видео {index+1} из {len(url_list)}...")
+            
+            vid_req = youtube.videos().list(part="snippet", id=v_id).execute()
+            total_cost += 1
+            if not vid_req['items']:
+                continue
+                
+            title = vid_req['items'][0]['snippet']['title']
+            
+            # Название файла берем по первому видео
+            if index == 0:
+                first_file_name = f"{re.sub(r'[^\w\s-]', '', title)[:30]}.xlsx"
+            
+            combined_titles += f"\n- {title}"
+            
+            # Транскрипция
+            transcript = get_video_transcript(v_id)
+            if transcript:
+                combined_transcripts += f"\n[Видео: {title}]: {transcript}"
+            
+            req = youtube.commentThreads().list(part="snippet,replies", videoId=v_id, maxResults=100)
+            fetched_count = 0
+            while req:
+                resp = req.execute()
+                total_cost += 1 
+                for item in resp['items']:
+                    top = item['snippet']['topLevelComment']['snippet']
+                    all_data.append({
+                        'Видео': title, # ДОБАВЛЕН ЗАГОЛОВОК ВИДЕО
+                        'Автор': top['authorDisplayName'], 
+                        'Текст': top['textDisplay'], 
+                        'Тип': 'Комментарий', 
+                        'Лайки': top['likeCount']
+                    })
+                    fetched_count += 1
+                    
+                    if item['snippet']['totalReplyCount'] > 0:
+                        if use_deep_scan:
+                            status_text.text(f"🔥 Deep Scan (Видео {index+1})... Квота: {total_cost}")
+                            replies, r_cost = get_replies_recursive(youtube, item['id'], lambda x: None, title)
+                            all_data.extend(replies)
+                            total_cost += r_cost
+                            fetched_count += len(replies)
+                        elif 'replies' in item:
+                            for r in item['replies']['comments']:
+                                all_data.append({
+                                    'Видео': title, # ДОБАВЛЕН ЗАГОЛОВОК ВИДЕО
+                                    'Автор': r['snippet']['authorDisplayName'], 
+                                    'Текст': r['snippet']['textDisplay'], 
+                                    'Тип': 'Ответ', 
+                                    'Лайки': r['snippet']['likeCount']
+                                })
+                                fetched_count += 1
+                
+                bar.progress(min(fetched_count % 100, 100), text=f"Видео {index+1}: собрано {fetched_count} | Квота: {total_cost}")
+                if 'nextPageToken' in resp: req = youtube.commentThreads().list_next(req, resp)
+                else: break
+                
+        except Exception as e:
+            st.error(f"Ошибка в ссылке {index+1}: {str(e)}")
+            continue # Идем к следующему видео, если в этом ошибка
+            
     bar.empty()
     status_text.empty()
-    return all_data, file_name, title, transcript, total_cost
+    return all_data, first_file_name, combined_titles, combined_transcripts, total_cost
 
 # --- ИНТЕРФЕЙС ---
 st.markdown("<h3 style='text-align: center;'>YouTubeComm</h3>", unsafe_allow_html=True)
 
 st.link_button("📊 Проверить остаток квоты", "https://console.cloud.google.com/apis/api/youtube.googleapis.com/quotas")
 
-raw_url = st.text_input("", placeholder="Ссылка на видео или Shorts...")
+# ИЗМЕНЕНО НА ТЕКСТОВУЮ ЗОНУ (Много строк)
+raw_urls = st.text_area("", placeholder="Вставьте ссылки (каждая с новой строки)...", height=100)
 
 with st.container(border=True):
     c1, c2 = st.columns(2)
@@ -204,13 +239,13 @@ with info_col:
         st.caption("Лимит: 10 000 ед./день")
 
 if start_btn:
-    if not raw_url: st.warning("Нет ссылки!")
+    if not raw_urls: st.warning("Нет ссылок!")
     else:
         st.session_state['ai_verdict'] = None
         st.session_state['processed'] = False
         
-        with st.spinner('Парсинг...'):
-            data, fname, title, transcript, cost = process_full_data(API_KEY, raw_url, deep_scan)
+        with st.spinner('Парсинг видео...'):
+            data, fname, titles, transcripts, cost = process_multiple_videos(API_KEY, raw_urls, deep_scan)
             st.session_state['quota_used'] = cost
         
         if data:
@@ -221,7 +256,7 @@ if start_btn:
             ai_text = None
             if use_ai:
                 with st.spinner('AI Анализ...'):
-                    ai_text = get_ai_verdict(title, transcript, data, deep_scan)
+                    ai_text = get_ai_verdict(titles, transcripts, data, deep_scan)
                     st.session_state['ai_verdict'] = ai_text
             
             quota_msg = f"Потрачено квоты: {cost}"
@@ -230,7 +265,7 @@ if start_btn:
             if sent: st.success("✅ Файл в Telegram!")
             st.session_state['processed'] = True
             st.rerun()
-        else: st.error(f"Ошибка: {fname}")
+        else: st.error("Не удалось выгрузить данные. Проверьте ссылки.")
 
 if st.session_state['processed'] and st.session_state['ai_verdict']:
     st.divider()
